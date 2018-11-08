@@ -11,33 +11,20 @@ class CsvNormalizationException < StandardError
   end
 end
 
-class IoEncodingNormalizer
-  def initialize(io, encoding, encode_options)
-    @io = io
-    @encoding = encoding
-    @encode_options = encode_options
-  end
-
-  def gets(sep)
-    x = @io.gets(sep)&.encode(@encoding, @encode_options)
-#    STDERR.puts "DEBUG:x:#{x}"
-    return x
-  end
-
-  def method_missing(m, *args, &block)
-    @io.send(m, args, block)
-  end
-end
-
 class CsvNormalizer
 
   SECONDS_IN_HOUR = 3600
   SECONDS_IN_MINUTE = 60
-  DURATION_RE = Regexp.new('(\d{1,2}):(\d{2}):(\d{2})\.(\d+)')
+  DURATION_RE = Regexp.new('(\d{1,2}):(\d{2}):(\d{2}\.\d+)')
 
   attr_accessor :logger
   def initialize(logger = Logger.new($stderr))
     self.logger = logger
+    # see https://bugs.ruby-lang.org/issues/10085
+    if RUBY_VERSION < '2.4'
+      logger.warn "Possibly invalid upcasing of names"
+    end
+
   end
 
   # Convert the provided `timestr` from US/Pacific to US/Eastern and
@@ -67,9 +54,11 @@ class CsvNormalizer
     '%05d' % Integer(zipstr)
   end
 
-  # Convert the provided `namestr` to upper case.
+  # Convert the provided `namestr` to upper case. Note that different
+  # languages use different conversion rules so this is not guaranteed
+  # to work for names from all languages (e.g. Turkish)
   def normalize_fullname_string(namestr)
-    namestr.upcase
+    namestr&.upcase
   end
 
   # Convert the provided `durationstr` in the format HH:MM:SS.MS into
@@ -79,13 +68,14 @@ class CsvNormalizer
     if m = DURATION_RE.match(durationstr)
       Integer(m[1]) * SECONDS_IN_HOUR +
         Integer(m[2]) * SECONDS_IN_MINUTE +
-        Integer(m[3]) +
-        Float(m[4])
+        Float(m[3])
     else
       raise "Cannot parse duration"
     end
   end
 
+  # Normalize `columnkey` in `row` using `method`.  If this fails,
+  # raise a CsvNormalizationException
   def normalize_column(row, columnkey, method)
     if !row.has_key?(columnkey)
       raise CsvNormalizationException.new(columnkey,
@@ -100,32 +90,38 @@ class CsvNormalizer
     end
   end
 
+  # read a line from `in_io` and ensure the line is UTF-8 encoded,
+  # replacing any undefined or invalid characters with the Unicode
+  # Replacement Character
+  def get_utf8_normalized_line(in_io)
+    in_io.gets&.encode("utf-8", { undef: :replace,
+                                  invalid: :replace,
+                                  replace: "\uFFFD" })
+  end
+
   def normalize(in_io, out_io)
-    nin_io = IoEncodingNormalizer.new(in_io, "utf-8", { undef: :replace,
-                                                        invalid: :replace,
-                                                        replace: "\uFFFD" })
-    in_csv = CSV.new(nin_io, headers: true, row_sep:"\r\n")
-    STDERR.puts "DEBUG:" + in_csv.shift.inspect
-    out_csv = CSV.new(out_io, write_headers: true)
-    in_csv.each.with_index do |row,i|
-      if i == 0
-        out_csv << in_csv.headers
+    headers = nil
+    while line = get_utf8_normalized_line(in_io)
+      if !headers
+        headers = CSV.parse_line(line)
+        out_io.puts(line.strip)
+        next
       end
       begin
+        row = CSV.parse_line(line, headers: headers)
         normalize_column(row, 'Timestamp', :normalize_timestamp_string)
         normalize_column(row, 'ZIP', :normalize_zip_string)
         normalize_column(row, 'FullName', :normalize_fullname_string)
         normalize_column(row, 'FooDuration', :normalize_duration_string)
         normalize_column(row, 'BarDuration', :normalize_duration_string)
         row['TotalDuration'] = row['FooDuration'] + row['BarDuration']
-        out_csv << row
+        out_io.write(CSV.generate_line(row, headers: headers))
       rescue CsvNormalizationException => cne
         logger.warn cne.message
       rescue Exception => e
         logger.warn "Unhandled normalization error"
         logger.warn e
       end
-      out_io.flush
     end
   end
 end
